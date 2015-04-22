@@ -2,28 +2,28 @@ package scorers;
 
 import java.io.IOException;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
-import java.util.List;
-import java.util.Set;
+import lm.AccurateDocsLengthLMResults;
+import lm.LanguageModelResults;
+import lm.LuceneLMResults;
 
 import obj.ClarityScore;
 
 import org.apache.lucene.index.Fields;
-import org.apache.lucene.index.MultiFields;
 import org.apache.lucene.index.Term;
+import org.apache.lucene.index.TermContext;
 import org.apache.lucene.index.Terms;
 import org.apache.lucene.index.TermsEnum;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.ScoreDoc;
+import org.apache.lucene.search.TermStatistics;
 import org.apache.lucene.search.TopDocs;
-import org.apache.lucene.search.spans.SpanNearQuery;
-import org.apache.lucene.search.spans.SpanOrQuery;
-import org.apache.lucene.search.spans.SpanQuery;
-import org.apache.lucene.search.spans.SpanTermQuery;
 
 import com.aliasi.util.BoundedPriorityQueue;
 
 import utils.MathUtils;
+import utils.StringUtils;
 import utils.Utils;
 
 
@@ -33,36 +33,40 @@ public class ClarityScorer{
 		m_searcher = searcher;
 	}
 
-	
 	/**
 	 * query-clarity = SUM_w{P(w|Q)*log(P(w|Q)/P(w))}
      * P(w)=cf(w)/|C|
-	 * @param query
+	 * @param queryLine input query
+	 * @param topDocs 
+	 * @param type type - 1 = Lucene, 2 = accurate length (from Hadas)
+	 * @param period 1 = mixed, 2 = modern (wikipedia)
 	 * @return
 	 * @throws IOException
 	 */
-	public double score(List<Set<String>> queryList) throws IOException {
+	public double score(String queryLine, int topDocs, int type, int period) throws IOException {
+		HashSet<String> querySet = StringUtils.String2PhraseSet(queryLine);
 		queue = new BoundedPriorityQueue<ClarityScore>(ClarityScore.ClarityScoreComparator, maxSize);
 		double sum_w = 0;
-		long C= m_searcher.collectionStatistics(Constants.field).sumTotalTermFreq();
-		// start with the query
-		// extract the set of documents containing term t
-		SpanQuery[] andQ = new SpanQuery[queryList.size()];
-		int i=0;
-		for(Set<String> queryTerms:queryList){
-			SpanOrQuery orQ = new SpanOrQuery();
-			for(String q:queryTerms)
-				orQ.addClause(new SpanTermQuery(new Term(Constants.field,q)));
-			andQ[i] = orQ;
-			i++;
+		TopDocs td;
+		LanguageModelResults lm;
+		if(type ==1){
+//			lm = new LuceneTermLMResults();
+			lm = new LuceneLMResults(m_searcher);
+			td = lm.searchLM(queryLine, topDocs);
+		} else {
+			lm = new AccurateDocsLengthLMResults(period);
+			td = lm.searchLM(queryLine, topDocs);
 		}
-		SpanNearQuery nearQ = new SpanNearQuery(andQ,0,true);
-		TopDocs td = m_searcher.search(nearQ, topDocs);
+		
+		m_searcher = lm.getIndexSearcher();
+		long C= m_searcher.collectionStatistics(Constants.field).sumTotalTermFreq();
+
 		HashMap<Integer,Double> priors = new HashMap<Integer, Double>();
 		HashMap<String,HashMap<Integer,Long>> freqData = new HashMap<String, HashMap<Integer,Long>>();
 		for (ScoreDoc scoreDoc : td.scoreDocs) {
 			int docId = scoreDoc.doc;
 			priors.put(scoreDoc.doc, (double)scoreDoc.score);
+//			System.out.println(scoreDoc.score);
 			Fields termVector = m_searcher.getIndexReader().getTermVectors(docId);
 			Terms terms = termVector.terms(Constants.field);
 			TermsEnum te = terms.iterator(null);
@@ -82,31 +86,29 @@ public class ClarityScorer{
 		// posterior
 		_logtoposterior(priors);
 		
-		Fields fields = MultiFields.getFields(m_searcher.getIndexReader());
-		Terms terms = fields.terms(Constants.field);
-		if (terms != null) {
-			TermsEnum termsEnum = null;
-			termsEnum = terms.iterator(termsEnum);
-			while (termsEnum.next() != null){
-				double p_w = (double)termsEnum.totalTermFreq()/(double)C;
-				String t = termsEnum.term().utf8ToString();
-				if (!freqData.containsKey(t))
-					continue;
-				HashMap<Integer, Long> freqMap = freqData.get(t);
-				double t_sum = 0;
-				for(int docId:freqMap.keySet()){
-					double p = priors.get(docId);
-					int d = Integer.parseInt(m_searcher.getIndexReader().document(docId).get("LENGTH"));
-					double p_t = (double)freqMap.get(docId)/d;
-					t_sum += (p_t*p);
-				}
-				double w_clarity = t_sum*MathUtils.Log(t_sum/p_w,2);
-				queue.offer(new ClarityScore(t, w_clarity));
-				sum_w += w_clarity;
-				}
+		for (String t:freqData.keySet()){
+		    Term trm = new Term(Constants.field,t);
+			TermStatistics ts = m_searcher.termStatistics(trm, TermContext.build(m_searcher.getIndexReader().getContext(), trm));
+			double p_w = (double) ts.totalTermFreq()/(double)C;
+			HashMap<Integer, Long> freqMap = freqData.get(t);
+			double t_sum = 0;
+			for(int docId:freqMap.keySet()){
+				double p = priors.get(docId);
+				int d = Integer.parseInt(m_searcher.getIndexReader().document(docId).get("LENGTH"));
+				double p_t = (double)freqMap.get(docId)/d;
+				t_sum += (p_t*p);
 			}
-			return sum_w;
+			double w_clarity = t_sum*MathUtils.Log(t_sum/p_w,2);
+			if (!(querySet.contains(t) || t.contains("הפניה"))){
+				// t = t.replaceAll("\\*|\\(|\\)|-|\\+|$|@|#|%|\"|!|:", "");
+				// t = t.replace("?", "");
+				t = t.replaceAll("\\p{Punct}", "");
+				queue.offer(new ClarityScore(t, w_clarity));
+			}
+			sum_w += w_clarity;
 		}
+		return sum_w;
+	}
 		
 
 	
@@ -141,8 +143,8 @@ public class ClarityScorer{
 		return queue.iterator();
 	}
 	
+	
 private IndexSearcher m_searcher;
-private int topDocs = 5;
 //private double lambda = 0.5;
 private int maxSize = 30;
 private BoundedPriorityQueue<ClarityScore> queue;
